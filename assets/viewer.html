@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Protein Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0D0D1A; overflow: hidden; width: 100vw; height: 100vh; }
+        canvas { display: block; }
+
+        #tooltip {
+          position: fixed;
+          background: rgba(0, 212, 255, 0.15);
+          border: 1px solid rgba(0, 212, 255, 0.5);
+          border-radius: 10px;
+          padding: 10px 14px;
+          color: #fff;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          font-size: 13px;
+          pointer-events: none;
+          display: none;
+          backdrop-filter: blur(10px);
+          z-index: 100;
+        }
+        #tooltip .element { font-size: 22px; font-weight: bold; color: #00D4FF; }
+        #tooltip .atomid  { font-size: 11px; color: rgba(255,255,255,0.5); margin-top: 3px; }
+        #tooltip .coords  { font-size: 10px; color: rgba(255,255,255,0.35); margin-top: 2px; }
+
+        #hint {
+          position: fixed;
+          bottom: 88px;
+          left: 50%;
+          transform: translateX(-50%);
+          color: rgba(255,255,255,0.25);
+          font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+          font-size: 11px;
+          pointer-events: none;
+          white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+
+<div id="tooltip">
+    <div class="element" id="tt-element"></div>
+    <div class="atomid"  id="tt-atomid"></div>
+    <div class="coords"  id="tt-coords"></div>
+</div>
+
+<div id="hint">Drag · Pinch to zoom · Two-finger pan · Tap atom</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+
+    // ── CPK colour map ────────────────────────────────────────────────────────────
+    const CPK = {
+      H:0xFFFFFF, C:0x404040, N:0x3050F8, O:0xFF0D0D,
+      F:0x90E050, CL:0x1FF01F, BR:0xA62929, I:0x940094,
+      S:0xFFFF30, P:0xFF8000, FE:0xE06633, CA:0x3DFF00,
+      MG:0x8AFF00, ZN:0x7D80B0, CU:0xFF8040, NA:0xAB5CF2,
+      K:0x8F40D4, DEFAULT:0xFF69B4,
+    };
+    const NAMES = {
+      H:'Hydrogen', C:'Carbon', N:'Nitrogen', O:'Oxygen', S:'Sulfur',
+      P:'Phosphorus', F:'Fluorine', CL:'Chlorine', BR:'Bromine', I:'Iodine',
+      FE:'Iron', CA:'Calcium', MG:'Magnesium', ZN:'Zinc', CU:'Copper',
+      NA:'Sodium', K:'Potassium',
+    };
+    function cpkColor(el) { return CPK[(el||'').toUpperCase()] ?? CPK.DEFAULT; }
+
+    // ── Renderer ──────────────────────────────────────────────────────────────────
+    const renderer = new THREE.WebGLRenderer({ antialias:true, preserveDrawingBuffer:true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // ── Scene + camera ────────────────────────────────────────────────────────────
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0D0D1A);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 20);
+
+    // ── OrbitControls ─────────────────────────────────────────────────────────────
+    // This single block replaces all the hand-written drag/pinch/pan touch code.
+    // It gives us: one-finger rotate, pinch zoom, two-finger pan, smooth damping.
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;   // smooth momentum after releasing finger
+    controls.dampingFactor = 0.08;
+    controls.enablePan     = true;
+    controls.panSpeed      = 0.8;
+    controls.rotateSpeed   = 0.8;
+    controls.zoomSpeed     = 1.2;
+    controls.minDistance   = 2;
+    controls.maxDistance   = 100;
+    controls.touches = {
+      ONE: THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN,  // pinch = zoom, two-finger drag = pan
+    };
+
+    // ── Lights ────────────────────────────────────────────────────────────────────
+    scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 0.85);
+    keyLight.position.set(5, 10, 7);
+    scene.add(keyLight);
+
+    const fillLight = new THREE.DirectionalLight(0x4488ff, 0.3);
+    fillLight.position.set(-5, -5, -5);
+    scene.add(fillLight);
+
+    const rimLight = new THREE.PointLight(0x00D4FF, 0.4, 60);
+    rimLight.position.set(0, 8, 4);
+    scene.add(rimLight);
+
+    // ── Shared geometries (one instance, reused for all atoms/bonds) ──────────────
+    const GEO = {
+      large:  new THREE.SphereGeometry(0.35, 20, 20), // C
+      medium: new THREE.SphereGeometry(0.32, 18, 18), // most elements
+      small:  new THREE.SphereGeometry(0.22, 14, 14), // H
+      bond:   new THREE.CylinderGeometry(0.06, 0.06, 1, 8), // unit length, scaled per bond
+    };
+    function geoForElement(el) {
+      const u = (el||'').toUpperCase();
+      if (u === 'C') return GEO.large;
+      if (u === 'H') return GEO.small;
+      return GEO.medium;
+    }
+
+    // ── State ─────────────────────────────────────────────────────────────────────
+    let moleculeGroup = null;
+    let atomMeshes    = [];  // [{ mesh, atom }]
+
+    // ── Dispose helper ────────────────────────────────────────────────────────────
+    function disposeGroup(group) {
+      if (!group) return;
+      // Only dispose materials — geometries are shared instances, keep them alive.
+      group.traverse(obj => {
+        if (!obj.material) return;
+        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+        mats.forEach(m => m.dispose());
+      });
+    }
+
+    // ── Build molecule ────────────────────────────────────────────────────────────
+    function buildMolecule(data) {
+      if (moleculeGroup) { scene.remove(moleculeGroup); disposeGroup(moleculeGroup); }
+      atomMeshes    = [];
+      moleculeGroup = new THREE.Group();
+
+      const atoms = data.atoms || [];
+      const bonds = data.bonds || [];
+      if (atoms.length === 0) return;
+
+      // atomId → atom lookup
+      const atomMap = {};
+      atoms.forEach(a => { atomMap[a.atomId] = a; });
+
+      // Centroid → centre molecule at scene origin
+      let cx = 0, cy = 0, cz = 0;
+      atoms.forEach(a => { cx += a.x; cy += a.y; cz += a.z; });
+      cx /= atoms.length; cy /= atoms.length; cz /= atoms.length;
+
+      const S = 1.2; // Ångström → scene units
+
+      // Bonds (drawn first, atoms sit on top)
+      bonds.forEach(bond => {
+        const a1 = atomMap[bond.atom1Id];
+        const a2 = atomMap[bond.atom2Id];
+        if (!a1 || !a2) return;
+
+        const p1 = new THREE.Vector3((a1.x-cx)*S, (a1.y-cy)*S, (a1.z-cz)*S);
+        const p2 = new THREE.Vector3((a2.x-cx)*S, (a2.y-cy)*S, (a2.z-cz)*S);
+
+        const dir    = new THREE.Vector3().subVectors(p2, p1);
+        const length = dir.length();
+        if (length < 0.001) return;
+
+        const mid   = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+        const quat  = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+        const order = (bond.bondOrder || 'SING').toUpperCase();
+        const count = order === 'DOUB' ? 2 : order === 'TRIP' ? 3 : 1;
+        const perp  = new THREE.Vector3(0,0,1).applyQuaternion(quat).normalize();
+
+        for (let b = 0; b < count; b++) {
+          const mat  = new THREE.MeshPhongMaterial({ color:0xAAAAAA, shininess:50, specular:0x222222 });
+          const mesh = new THREE.Mesh(GEO.bond, mat);
+          mesh.scale.y = length;         // stretch unit cylinder to bond length
+          mesh.position.copy(mid);
+          mesh.quaternion.copy(quat);
+          if (count > 1) {
+            const offset = (b - (count-1)/2) * 0.10;
+            mesh.position.addScaledVector(perp, offset);
+          }
+          moleculeGroup.add(mesh);
+        }
+      });
+
+      // Atoms
+      atoms.forEach(atom => {
+        const el   = (atom.element || 'C').trim();
+        const mat  = new THREE.MeshPhongMaterial({ color:cpkColor(el), shininess:90, specular:0x555555 });
+        const mesh = new THREE.Mesh(geoForElement(el), mat);
+        mesh.position.set((atom.x-cx)*S, (atom.y-cy)*S, (atom.z-cz)*S);
+        moleculeGroup.add(mesh);
+        atomMeshes.push({ mesh, atom });
+      });
+
+      scene.add(moleculeGroup);
+
+      // Fit camera + orbit target to the molecule bounding box
+      const box    = new THREE.Box3().setFromObject(moleculeGroup);
+      const size   = box.getSize(new THREE.Vector3()).length();
+      const center = box.getCenter(new THREE.Vector3());
+
+      controls.target.copy(center);
+      camera.position.set(center.x, center.y, center.z + size * 1.8);
+      controls.minDistance = size * 0.3;
+      controls.maxDistance = size * 10;
+      controls.update();
+    }
+
+    // ── Atom tap detection (separate from OrbitControls drag) ─────────────────────
+    // OrbitControls owns all touch input for dragging/zooming/panning.
+    // We only piggyback to detect taps by comparing finger-down vs finger-up.
+    const TAP_MOVE = 10;   // px
+    const TAP_TIME = 250;  // ms
+
+    let tapStart  = null;
+    let mouseDown = null;
+
+    const tooltip = document.getElementById('tooltip');
+
+    function showTooltip(atom, sx, sy) {
+      const el = (atom.element || '').trim();
+      document.getElementById('tt-element').textContent = el;
+      document.getElementById('tt-atomid').textContent  =
+        (NAMES[el.toUpperCase()] ? NAMES[el.toUpperCase()] + ' · ' : '') + atom.atomId;
+      document.getElementById('tt-coords').textContent  =
+        `(${atom.x.toFixed(2)}, ${atom.y.toFixed(2)}, ${atom.z.toFixed(2)})`;
+
+      const TW = 160, TH = 72;
+      let tx = sx + 16, ty = sy - TH / 2;
+      if (tx + TW > window.innerWidth)       tx = sx - TW - 16;
+      if (ty < 8)                             ty = 8;
+      if (ty + TH > window.innerHeight - 8)  ty = window.innerHeight - TH - 8;
+      tooltip.style.left = tx + 'px';
+      tooltip.style.top  = ty + 'px';
+      tooltip.style.display = 'block';
+
+      if (window.AtomInfo) {
+        window.AtomInfo.postMessage(JSON.stringify({ element: el, atomId: atom.atomId }));
+      }
+    }
+    function hideTooltip() { tooltip.style.display = 'none'; }
+
+    function tryRaycast(sx, sy) {
+      const p = new THREE.Vector2(
+        (sx / window.innerWidth)  * 2 - 1,
+       -(sy / window.innerHeight) * 2 + 1
+      );
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(p, camera);
+      const hits = ray.intersectObjects(atomMeshes.map(a => a.mesh));
+      if (hits.length > 0) {
+        const entry = atomMeshes.find(a => a.mesh === hits[0].object);
+        if (entry) { showTooltip(entry.atom, sx, sy); return; }
+      }
+      hideTooltip();
+    }
+
+    // Touch
+    renderer.domElement.addEventListener('touchstart', e => {
+      tapStart = e.touches.length === 1
+        ? { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() }
+        : null;
+    }, { passive: true });
+
+    renderer.domElement.addEventListener('touchend', e => {
+      if (!tapStart || e.changedTouches.length !== 1) return;
+      const dx = Math.abs(e.changedTouches[0].clientX - tapStart.x);
+      const dy = Math.abs(e.changedTouches[0].clientY - tapStart.y);
+      const dt = Date.now() - tapStart.t;
+      if (dx < TAP_MOVE && dy < TAP_MOVE && dt < TAP_TIME) {
+        tryRaycast(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+      }
+      tapStart = null;
+    }, { passive: true });
+
+    // Mouse (desktop / browser preview)
+    renderer.domElement.addEventListener('mousedown', e => {
+      mouseDown = { x: e.clientX, y: e.clientY, t: Date.now() };
+    });
+    renderer.domElement.addEventListener('mouseup', e => {
+      if (!mouseDown) return;
+      const dx = Math.abs(e.clientX - mouseDown.x);
+      const dy = Math.abs(e.clientY - mouseDown.y);
+      if (dx < TAP_MOVE && dy < TAP_MOVE && Date.now() - mouseDown.t < TAP_TIME) {
+        tryRaycast(e.clientX, e.clientY);
+      }
+      mouseDown = null;
+    });
+
+    // ── Resize ────────────────────────────────────────────────────────────────────
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ── Animation loop ────────────────────────────────────────────────────────────
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update(); // must be called every frame when damping is on
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ── Flutter bridge ────────────────────────────────────────────────────────────
+    function loadLigand(jsonString) {
+      hideTooltip();
+      try { buildMolecule(JSON.parse(jsonString)); }
+      catch (e) { console.error('loadLigand error:', e); }
+    }
+
+    function getScreenshot() {
+      renderer.render(scene, camera);
+      return renderer.domElement.toDataURL('image/png');
+    }
+
+</script>
+</body>
+</html>
